@@ -123,6 +123,8 @@ impl MockAlist {
 }
 
 fn handle_one(stream: TcpStream, config: &MockConfig, put_index: &mut usize) -> Captured {
+    // Windows 上 accept 会继承监听 socket 的非阻塞属性，读请求头可能立刻 WouldBlock。
+    stream.set_nonblocking(false).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();

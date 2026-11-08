@@ -6,4 +6,5 @@ pub mod git;
 pub mod options;
 pub mod resume;
 pub mod state;
+pub mod ui;
 pub mod watcher;

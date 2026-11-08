@@ -9,9 +9,11 @@ use aether::resume::{self, ResumeStore};
 use aether::state::{
     ago, default_home, is_running, now, remaining, states, SharedState, State, StateStore,
 };
+use aether::ui;
 use aether::watcher::RepoWatcher;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -44,6 +46,21 @@ enum Command {
         /// Emit raw state JSON for scripting
         #[arg(long)]
         json: bool,
+        /// Refresh in place until Ctrl+C (terminal dashboard)
+        #[arg(long)]
+        watch: bool,
+        /// Refresh interval for --watch, e.g. 1s, 500ms
+        #[arg(long, default_value = "1s")]
+        interval: String,
+    },
+    /// Serve a local status dashboard at http://127.0.0.1:<port>
+    Ui {
+        /// TCP port to listen on (0 picks a free port)
+        #[arg(long, default_value_t = ui::DEFAULT_PORT)]
+        port: u16,
+        /// Open the dashboard in the default browser
+        #[arg(long)]
+        open: bool,
     },
     /// Upload a file or a directory tree to an Alist server (PUT /api/fs/put)
     Backup {
@@ -85,7 +102,18 @@ fn run() -> i32 {
             delay,
             path,
         } => start(strategy, delay, path),
-        Command::Status { json } => status(json),
+        Command::Status {
+            json,
+            watch,
+            interval,
+        } => status(json, watch, interval),
+        Command::Ui { port, open } => match ui::serve(default_home(), port, open) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("error: {error}");
+                1
+            }
+        },
         Command::Backup {
             local,
             remote,
@@ -436,13 +464,118 @@ struct StatusEnvelope {
     running: bool,
 }
 
-fn status(as_json: bool) -> i32 {
+fn render_status(state: &State, running: bool, state_path: &std::path::Path) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Aether: {}\n",
+        if running {
+            "RUNNING"
+        } else {
+            "NOT RUNNING (stopped or stale state)"
+        }
+    ));
+    out.push_str(&format!("  PID          {} ({})\n", state.pid, state.process_name));
+    out.push_str(&format!("  Started      {}\n", ago(state.started_at)));
+    out.push_str(&format!("  Heartbeat    {}\n", ago(state.heartbeat_at)));
+    out.push_str(&format!("  Repository   {}\n", state.repository));
+    let strategy = if state.strategy == "delay" {
+        format!("delay ({})", state.delay)
+    } else {
+        state.strategy.clone()
+    };
+    out.push_str(&format!("  Strategy     {strategy}\n"));
+    out.push_str(&format!("  Excluded     {}\n", state.excluded.join(", ")));
+    out.push_str(&format!("  State        {}\n", state.state));
+    out.push_str(&format!(
+        "  Events       {} change(s), last {}\n",
+        state.events_seen,
+        ago(state.last_change_at)
+    ));
+    out.push_str(&format!("  Pending      {} file(s)\n", state.pending_changes));
+    if state.next_sync_at != 0 {
+        out.push_str(&format!("  Next sync    in {}\n", remaining(state.next_sync_at)));
+    }
+    if state.last_sync_at != 0 {
+        out.push_str(&format!(
+            "  Last sync    {}  {}  {}\n",
+            ago(state.last_sync_at),
+            state.last_sync_result.to_uppercase(),
+            state.last_sync_message
+        ));
+    }
+    out.push_str(&format!("  State file   {}\n", state_path.display()));
+    out
+}
+
+/// `status --watch`：原地刷新，Ctrl+C 退出。返回最后一次读到的运行状态。
+fn watch_status(interval: Duration) -> i32 {
+    let store = StateStore::from_default_home();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_signal = Arc::clone(&stop);
+    if let Err(error) = ctrlc::set_handler(move || stop_signal.store(true, Ordering::Relaxed)) {
+        eprintln!("warning: could not install Ctrl+C handler: {error}");
+    }
+
+    let tick = Duration::from_millis(100);
+    let mut code = 1;
+    while !stop.load(Ordering::Relaxed) {
+        let (body, running) = match store.load() {
+            Some(state) => {
+                let running = is_running(&state);
+                (render_status(&state, running, store.path()), running)
+            }
+            None => (
+                format!(
+                    "Aether: NOT RUNNING (no state file at {})\n",
+                    store.path().display()
+                ),
+                false,
+            ),
+        };
+        code = if running { 0 } else { 1 };
+        // 清屏 + 回原点；Windows 10+ 终端默认支持 VT 序列。
+        print!("\x1b[2J\x1b[H{body}\x1b[2m  refresh {}\x1b[0m\n", format_duration(interval));
+        let _ = std::io::stdout().flush();
+
+        let mut slept = Duration::ZERO;
+        while slept < interval && !stop.load(Ordering::Relaxed) {
+            thread::sleep(tick);
+            slept += tick;
+        }
+    }
+    println!();
+    code
+}
+
+fn status(as_json: bool, watch: bool, interval_text: String) -> i32 {
+    if watch {
+        if as_json {
+            eprintln!("error: --watch cannot be combined with --json");
+            return 2;
+        }
+        let interval = match parse_duration(&interval_text) {
+            Ok(value) if value >= Duration::from_millis(100) => value,
+            Ok(_) => {
+                eprintln!("error: --interval must be at least 100ms");
+                return 2;
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                return 2;
+            }
+        };
+        return watch_status(interval);
+    }
+
     let store = StateStore::from_default_home();
     let Some(state) = store.load() else {
         if as_json {
             println!("null");
         } else {
-            println!("Aether: NOT RUNNING (no state file at {})", store.path().display());
+            println!(
+                "Aether: NOT RUNNING (no state file at {})",
+                store.path().display()
+            );
         }
         return 1;
     };
@@ -450,40 +583,17 @@ fn status(as_json: bool) -> i32 {
     let running = is_running(&state);
     if as_json {
         let envelope = StatusEnvelope { state, running };
-        println!("{}", serde_json::to_string_pretty(&envelope).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&envelope).unwrap_or_default()
+        );
         return if running { 0 } else { 1 };
     }
 
-    println!("Aether: {}", if running { "RUNNING" } else { "NOT RUNNING (stopped or stale state)" });
-    println!("  PID          {} ({})", state.pid, state.process_name);
-    println!("  Started      {}", ago(state.started_at));
-    println!("  Heartbeat    {}", ago(state.heartbeat_at));
-    println!("  Repository   {}", state.repository);
-    let strategy = if state.strategy == "delay" {
-        format!("delay ({})", state.delay)
+    print!("{}", render_status(&state, running, store.path()));
+    if running {
+        0
     } else {
-        state.strategy.clone()
-    };
-    println!("  Strategy     {strategy}");
-    println!("  Excluded     {}", state.excluded.join(", "));
-    println!("  State        {}", state.state);
-    println!(
-        "  Events       {} change(s), last {}",
-        state.events_seen,
-        ago(state.last_change_at)
-    );
-    println!("  Pending      {} file(s)", state.pending_changes);
-    if state.next_sync_at != 0 {
-        println!("  Next sync    in {}", remaining(state.next_sync_at));
+        1
     }
-    if state.last_sync_at != 0 {
-        println!(
-            "  Last sync    {}  {}  {}",
-            ago(state.last_sync_at),
-            state.last_sync_result.to_uppercase(),
-            state.last_sync_message
-        );
-    }
-    println!("  State file   {}", store.path().display());
-    if running { 0 } else { 1 }
 }

@@ -54,7 +54,8 @@ export PATH="$PWD/target/release:$PATH"
 
 ```
 aether start [--strategy immediate|delay|never] [--delay <duration>] [--path <dir>]
-aether status [--json]
+aether status [--json] [--watch [--interval <duration>]]
+aether ui [--port <port>] [--open]
 aether backup --local <file|dir> --remote <dir> [--on-conflict skip|overwrite|rename] [--resume] [--reset-resume] [--json] [--url <url>] [--token <token>]
 ```
 
@@ -63,6 +64,8 @@ aether backup --local <file|dir> --remote <dir> [--on-conflict skip|overwrite|re
 | `aether start` | 前台监听，Ctrl+C 优雅退出；自动定位 `git rev-parse --show-toplevel` 作为监听根 |
 | `aether status` | 查看监听状态；进程存活返回 0，未运行返回 1 |
 | `aether status --json` | 输出完整状态 JSON，便于脚本集成 |
+| `aether status --watch` | 终端原地刷新（默认 1s，`--interval 500ms` 可调），Ctrl+C 退出 |
+| `aether ui` | 本地状态面板：`http://127.0.0.1:7878`，浏览器看倒计时，`--open` 自动打开 |
 | `aether backup` | 阻塞式上传文件或整个目录树到 Alist，默认跳过云端冲突，`--resume` 支持断点续跑（详见下方章节），不依赖监听进程 |
 
 `--delay` 支持 `10m`、`30s`、`2h`、`500ms`、`1d`；纯数字按分钟。默认 `10m`。
@@ -102,6 +105,33 @@ aether status
 - 倒计时显示基于状态中的 `nextSyncAt`（Unix 秒），无需引擎持续刷新。
 
 `aether status` 输出字段：PID、启动/心跳时间、仓库路径、策略、排除项、状态、事件计数、待提交数、下次同步倒计时、上次同步结果、状态文件路径。
+
+## 状态面板（ui）
+
+不装托盘、不引 GUI 框架，起来就是一个网页看板——解决「普通用户看不见倒计时」这件事：
+
+```bash
+aether start --strategy delay &     # 引擎照常跑
+aether ui --open                    # http://127.0.0.1:7878
+```
+
+- 大环倒计时（按 `nextSyncAt` 每秒插值，浏览器和服务端时钟偏差由 `/api/state` 的 `remainingSeconds` 校准）
+- 策略、排除项、待提交文件数、变更事件数、心跳、上次同步结果与消息
+- 流程指示：监听变动 → 倒计时 → 提交 → 推送
+- 深 / 浅色跟随系统 `prefers-color-scheme`，无外部字体、脚本、CDN，断网也能看
+- 面板与引擎**进程解耦**：读的是 `~/.aether/state.json`，引擎被强杀后页面会显示「未运行」
+
+接口（可被未来的原生托盘直接复用）：
+
+| 路径 | 说明 |
+| --- | --- |
+| `GET /` | 单页看板（内嵌 HTML，无外链资源） |
+| `GET /api/state` | 结构化快照：`running` / `now` / `remainingSeconds` / `delaySeconds` / `heartbeatAgeSeconds` / `statePath` / `state`（原始状态，未启动时为 `null`） |
+| `GET /healthz` | `ok`，用于探活 |
+
+实现只用 `std::net`：非阻塞 accept + 连接线程，`Content-Length` + `Connection: close`，单请求头上限 8 KiB。**只绑定 `127.0.0.1`**——面板没有鉴权，绑 `0.0.0.0` 等于把仓库路径和提交信息广播到局域网。
+
+> Windows 上 `accept` 出来的 socket 会**继承监听 socket 的非阻塞属性**，必须在每个连接上 `set_nonblocking(false)`，否则读请求头会随机 `WouldBlock` 直接丢连接。这个坑在 UI 服务和测试 mock server 里都踩过一次。
 
 ## Alist 备份（backup）
 
@@ -205,7 +235,7 @@ aether::alist::upload_to_alist(url, token, local_path, remote_dir) -> Result<Str
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/main.rs` | CLI 解析、启动校验、`status` 渲染、`backup` 批量进度 / 汇总 / `--json` 与环境变量 |
+| `src/main.rs` | CLI 解析、启动校验、`status` 渲染与 `--watch`、`backup` 批量进度 / 汇总 / `--json` 与环境变量 |
 | `src/options.rs` | 策略枚举、时长解析、窗口常量 |
 | `src/filter.rs` | 路径段排除规则 |
 | `src/watcher.rs` | `notify` 递归监听 → mpsc 事件流 |
@@ -215,8 +245,10 @@ aether::alist::upload_to_alist(url, token, local_path, remote_dir) -> Result<Str
 | `src/alist.rs` | Alist `/api/fs/put` / `/api/fs/get` 阻塞请求、路径编码、响应判定、进度计数 |
 | `src/backup.rs` | 目录递归枚举、冲突策略、本地占用检测、断点接入、结构化 `BatchReport` |
 | `src/resume.rs` | 任务身份哈希、断点清单持久化与指纹失效、清单位置保护 |
+| `src/ui.rs` | 零依赖 HTTP 状态面板：`/` 单页看板、`/api/state` 快照、`/healthz`；`UiServer` 可嵌入式启动 |
 | `tests/integration.rs` | 真实临时仓库 + bare remote 端到端测试 |
 | `tests/alist.rs` | 本地多请求 TCP mock server，验证 PUT/POST 请求形状、批量、排除、三策略与 CLI 退出码 |
+| `tests/ui.rs` | 真实 TCP 请求验证面板：首页 / JSON / 404 / 405 / 并发 / 无状态文件 / 心跳过期 |
 
 ## 已知限制
 
@@ -227,6 +259,8 @@ aether::alist::upload_to_alist(url, token, local_path, remote_dir) -> Result<Str
 - `backup` 的断点续传是**任务级**：已完成的文件不重传；但 Alist 没有 Range / 分片接口，单个大文件中断后仍需整文件重传。冲突判定只看云端存在性 + size，未做 hash / 时间戳比对。
 - 批量为顺序上传、未并发；大目录耗时较长。目录模式依赖 Alist 自动创建父目录，尚未实机验证。
 - `backup` 尚未接入 `start` 的自动同步流程（不会在 commit 后自动备份），两者相互独立。
+- `aether ui` 是**只读**面板：能看状态，不能暂停 / 切策略 / 立即同步；也没有鉴权，只监听 `127.0.0.1`。
+- 尚未提供原生系统托盘（会引入 GUI 框架依赖，跨平台构建成本高）；面板的 `/api/state` 已按托盘所需字段设计，后续接托盘不用改状态层。
 
 ## 测试覆盖
 
@@ -238,15 +272,17 @@ Alist 部分另外覆盖：远程路径归一化与 `..` 拒绝、中文/空格�
 
 断点续传部分覆盖：任务 key 对站点 / 远程目录 / 本地路径三者敏感且稳定、清单原子读写与往返、损坏或跨任务清单自愈、`size`/`mtime` 变化即失效、`clear` 幂等且不影响其他任务、拒绝 `AETHER_HOME` 落在被备份树内；CLI 侧用同一个 mock server 连跑两次，验证「中断后只补传失败项、已完成项零请求」、本地文件改动后重新上传、不带 `--resume` 行为不变、整批成功后清单自动清理、`--reset-resume` 强制全量、`--json` 的 `resumed` 与 `detail` 可被 UI 消费。
 
+UI 部分覆盖：快照 JSON 的 camelCase 字段与 `state: null`、倒计时剩余秒数（含已过期不下溢为负数）、无状态文件 / 心跳过期判定、首页内嵌页面不含任何外链资源；集成测试起真实 `UiServer`（端口 0）后用原始 TCP 发请求，断言 `GET /` 200 + `text/html`、`/api/state` 的 `running` / `remainingSeconds` / `delaySeconds`、未知路径 404、`POST` 405、`/healthz` 200、以及 8 线程并发请求全部成功。
+
 ## 后续路线（TODO）
 
-状态：**#1、#2、#3 已实现**；#4 未开始。
+状态：**#1、#2、#3 已实现**；#4 已完成网页看板（原生托盘仍待办）。
 
 | # | 待办 | 状态 | 关键约束 / 落点 |
 | --- | --- | --- | --- |
 | 1 | 目录递归与批量备份 | ✅ 已实现 | `src/backup.rs::plan` 递归枚举，排除 `.git` / `bin` / `obj`，失败继续并汇总，进度按整体字节。**遗留**：Alist `PUT` 是否自动创建多级父目录尚未用真实服务端验证，若不支持需补 `/api/fs/mkdir`。 |
 | 2 | 断点续传与分片 | ✅ 已实现（任务级） | **字节级续传不可行**：Alist `/api/fs/put` 是整文件 PUT，官方无分片合并 / Range 接口（`Content-Range` 仅第三方 OpenList_Chunk fork）。已实现任务级断点：`src/resume.rs` 持久化已完成文件指纹到 `~/.aether/backups/`，逐项落盘、失败保留、成功后自清理，`--resume` / `--reset-resume` 控制。**遗留**：单文件中断仍需整文件重传。 |
 | 3 | 同步防冲突校验 | ✅ 已实现 | `POST /api/fs/get` 探测 + size 比对，默认 `skip`，另有 `overwrite` / `rename`；本地占用用 open 预检 + 上传前后 metadata 一致性。**遗留**：未做 hash / 时间戳大小比对；`--json` 的 `BatchReport.detail` 已结构化保留冲突原因，待 #4 的 UI 消息中心直接消费。 |
-| 4 | 系统托盘 / UI | 未开始 | 架构级改动：tray-icon + 事件循环与 `notify` watcher 线程整合；状态可复用 `~/.aether/state.json` 的 5s 心跳。**冲突消息**接 `BatchReport`（跳过 / 失败原因）展示在 UI 消息中心。建议先做 `status --watch` 或本地 HTML 状态页验证需求，再上原生托盘。 |
+| 4 | 系统托盘 / UI | ✅ 已实现（网页看板） | `src/ui.rs`：`aether ui` 起 `127.0.0.1:7878` 单页看板（大环倒计时 + 策略 / 待提交 / 心跳 / 上次同步 + 流程指示），`status --watch` 提供终端等价物，`/api/state` 供托盘复用。零新依赖、离线可用、引擎被杀也能显示未运行。**遗留**：只读（不能暂停 / 切策略 / 立即触发）、无鉴权故不对外监听、原生托盘未做；`BatchReport` 的冲突消息尚未接入看板（当前看板只读状态文件，不读备份报告）。 |
 
 关联现状：`backup` 已支持目录批量，但仍未接入 `start` 的 commit 后自动同步流程；详见「已知限制」。
