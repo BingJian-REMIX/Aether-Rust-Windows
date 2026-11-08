@@ -284,15 +284,16 @@ const INDEX_HTML: &str = r##"<!doctype html>
     font:14px/1.55 ui-sans-serif,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
     display:flex; align-items:center; justify-content:center; padding:28px;
   }
-  .shell{width:min(880px,100%); display:flex; flex-direction:column; gap:18px}
+  .shell{width:min(880px,100%); min-width:0; display:flex; flex-direction:column; gap:18px}
   header{display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap}
-  .brand{display:flex; align-items:center; gap:10px}
+  .brand{display:flex; align-items:center; gap:10px; min-width:0}
   .brand h1{font-size:18px; margin:0; letter-spacing:-.01em}
   .dot{width:9px; height:9px; border-radius:50%; background:var(--muted); box-shadow:0 0 0 4px color-mix(in srgb,var(--muted) 18%,transparent)}
   body[data-running="on"] .dot{background:var(--ok); box-shadow:0 0 0 4px color-mix(in srgb,var(--ok) 20%,transparent)}
   .pill{font-size:12px; padding:3px 10px; border-radius:999px; border:1px solid var(--line); color:var(--muted); background:var(--panel)}
   body[data-running="on"] .pill{color:var(--ok); border-color:color-mix(in srgb,var(--ok) 35%,var(--line))}
-  .repo{font-size:12px; color:var(--muted); max-width:52ch; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  /* 仓库路径可能很长：允许收缩并省略号截断，否则 nowrap 的 max-content 会把整页撑宽。 */
+  .repo{font-size:12px; color:var(--muted); flex:1 1 auto; min-width:0; max-width:52ch; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
   .hero{display:grid; grid-template-columns:190px 1fr; gap:18px; align-items:stretch}
   @media (max-width:640px){ .hero{grid-template-columns:1fr} }
   .ring{background:var(--panel); border:1px solid var(--line); border-radius:18px; box-shadow:var(--shadow); display:grid; place-items:center; padding:14px}
@@ -300,11 +301,14 @@ const INDEX_HTML: &str = r##"<!doctype html>
   .ring circle{fill:none; stroke-width:8; stroke-linecap:round}
   .track{stroke:var(--line)}
   .bar{stroke:var(--accent); transition:stroke-dashoffset .28s linear, stroke .3s}
-  .ring .label{position:absolute; text-align:center}
+  .ring .label{position:absolute; display:flex; flex-direction:column; align-items:center; gap:2px; text-align:center}
   .ring-wrap{position:relative; display:grid; place-items:center}
-  .count{font-size:26px; font-weight:650; letter-spacing:-.02em; font-variant-numeric:tabular-nums}
-  .count small{display:block; font-size:11px; font-weight:500; color:var(--muted); letter-spacing:0}
+  .count{display:block; font-size:26px; font-weight:650; letter-spacing:-.02em; font-variant-numeric:tabular-nums; line-height:1.1}
+  /* small 与 .count 是兄弟节点，选择器不能写成 `.count small`（子代），否则整行挤在一起。 */
+  .ring .label small{display:block; font-size:11px; font-weight:500; color:var(--muted); letter-spacing:0; line-height:1.2}
   .grid{display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px}
+  /* 手机宽度下两列会挤成豆腐块，改成单列。必须写在 `.grid` 之后才生效。 */
+  @media (max-width:520px){ .grid{grid-template-columns:1fr} }
   .card{background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:12px 14px; box-shadow:var(--shadow); min-width:0}
   .card span{display:block; font-size:11px; color:var(--muted); letter-spacing:.04em; text-transform:uppercase}
   .card strong{display:block; font-size:16px; font-weight:600; margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
@@ -510,5 +514,15 @@ mod tests {
         assert!(!INDEX_HTML.contains("src=\"http"));
         assert!(!INDEX_HTML.contains("href=\"http"));
         assert!(INDEX_HTML.contains("/api/state"));
+    }
+
+    #[test]
+    fn countdown_label_stacks_under_the_digits() {
+        // 回归：`<small>` 是 `<span class="count">` 的兄弟节点，
+        // 写成 `.count small` 匹配不到，文字会和数字挤在同一行。
+        assert!(INDEX_HTML.contains("<span class=\"count\" id=\"count\">"));
+        assert!(INDEX_HTML.contains("<small id=\"countLabel\">"));
+        assert!(!INDEX_HTML.contains(".count small{"));
+        assert!(INDEX_HTML.contains(".ring .label small{display:block"));
     }
 }
