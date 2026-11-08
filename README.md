@@ -104,6 +104,8 @@ aether status
 - 状态写入采用临时文件 + 原子替换，`status` 不会读到半截 JSON。
 - 倒计时显示基于状态中的 `nextSyncAt`（Unix 秒），无需引擎持续刷新。
 
+另有一个 `~/.aether/last-backup.json`，由 `aether backup` 结束时原子写入：本地路径、远端目录、上传 / 跳过 / 失败 / 命中续传数、总字节、耗时、完成时间。**单独一个文件而不是塞进 `state.json`**——备份是独立命令，可能和 `start` 的引擎进程同时存在，写同一份状态会互相覆盖（引擎每 5s 心跳写一次）。文件缺失或损坏只当作「没有备份记录」，不影响看板其余部分。
+
 `aether status` 输出字段：PID、启动/心跳时间、仓库路径、策略、排除项、状态、事件计数、待提交数、下次同步倒计时、上次同步结果、状态文件路径。
 
 ## 状态面板（ui）
@@ -118,6 +120,7 @@ aether ui --open                    # http://127.0.0.1:7878
 - 大环倒计时（按 `nextSyncAt` 每秒插值，浏览器和服务端时钟偏差由 `/api/state` 的 `remainingSeconds` 校准）
 - 策略、排除项、待提交文件数、变更事件数、心跳、上次同步结果与消息
 - 流程指示：监听变动 → 倒计时 → 提交 → 推送
+- 底部「上次备份」一行：直接读 `~/.aether/last-backup.json`，显示上传 / 跳过 / 失败数、距今时间、远端目录、总字节、耗时；失败数 > 0 时标红。从来没有备份过就显示「尚无记录」
 - 深 / 浅色跟随系统 `prefers-color-scheme`，无外部字体、脚本、CDN，断网也能看
 - 面板与引擎**进程解耦**：读的是 `~/.aether/state.json`，引擎被强杀后页面会显示「未运行」
 
@@ -126,7 +129,7 @@ aether ui --open                    # http://127.0.0.1:7878
 | 路径 | 说明 |
 | --- | --- |
 | `GET /` | 单页看板（内嵌 HTML，无外链资源） |
-| `GET /api/state` | 结构化快照：`running` / `now` / `remainingSeconds` / `delaySeconds` / `heartbeatAgeSeconds` / `statePath` / `state`（原始状态，未启动时为 `null`） |
+| `GET /api/state` | 结构化快照：`running` / `now` / `remainingSeconds` / `delaySeconds` / `heartbeatAgeSeconds` / `statePath` / `state`（原始状态，未启动时为 `null`）/ `lastBackup`（最近一次备份摘要，从未备份为 `null`） |
 | `GET /healthz` | `ok`，用于探活 |
 
 实现只用 `std::net`：非阻塞 accept + 连接线程，`Content-Length` + `Connection: close`，单请求头上限 8 KiB。**只绑定 `127.0.0.1`**——面板没有鉴权，绑 `0.0.0.0` 等于把仓库路径和提交信息广播到局域网。
@@ -260,6 +263,7 @@ aether::alist::upload_to_alist(url, token, local_path, remote_dir) -> Result<Str
 - 批量为顺序上传、未并发；大目录耗时较长。目录模式依赖 Alist 自动创建父目录，尚未实机验证。
 - `backup` 尚未接入 `start` 的自动同步流程（不会在 commit 后自动备份），两者相互独立。
 - `aether ui` 是**只读**面板：能看状态，不能暂停 / 切策略 / 立即同步；也没有鉴权，只监听 `127.0.0.1`。
+- 看板的「上次备份」只有汇总数字和远端目录；逐项结果（哪个文件冲突、冲突原因）仍在终端输出和 `--json` 里，尚未做可展开的明细。
 - 尚未提供原生系统托盘（会引入 GUI 框架依赖，跨平台构建成本高）；面板的 `/api/state` 已按托盘所需字段设计，后续接托盘不用改状态层。
 
 ## 测试覆盖
@@ -272,7 +276,9 @@ Alist 部分另外覆盖：远程路径归一化与 `..` 拒绝、中文/空格�
 
 断点续传部分覆盖：任务 key 对站点 / 远程目录 / 本地路径三者敏感且稳定、清单原子读写与往返、损坏或跨任务清单自愈、`size`/`mtime` 变化即失效、`clear` 幂等且不影响其他任务、拒绝 `AETHER_HOME` 落在被备份树内；CLI 侧用同一个 mock server 连跑两次，验证「中断后只补传失败项、已完成项零请求」、本地文件改动后重新上传、不带 `--resume` 行为不变、整批成功后清单自动清理、`--reset-resume` 强制全量、`--json` 的 `resumed` 与 `detail` 可被 UI 消费。
 
-UI 部分覆盖：快照 JSON 的 camelCase 字段与 `state: null`、倒计时剩余秒数（含已过期不下溢为负数）、无状态文件 / 心跳过期判定、首页内嵌页面不含任何外链资源；集成测试起真实 `UiServer`（端口 0）后用原始 TCP 发请求，断言 `GET /` 200 + `text/html`、`/api/state` 的 `running` / `remainingSeconds` / `delaySeconds`、未知路径 404、`POST` 405、`/healthz` 200、以及 8 线程并发请求全部成功。
+UI 部分覆盖：快照 JSON 的 camelCase 字段与 `state: null`、倒计时剩余秒数（含已过期不下溢为负数）、无状态文件 / 心跳过期判定、首页内嵌页面不含任何外链资源、备份摘要能进快照且损坏的 `last-backup.json` 只被忽略而不报错、倒计时文案与数字的分层（回归：选择器写成子代会让两行挤成一行）；集成测试起真实 `UiServer`（端口 0）后用原始 TCP 发请求，断言 `GET /` 200 + `text/html`、`/api/state` 的 `running` / `remainingSeconds` / `delaySeconds`、未知路径 404、`POST` 405、`/healthz` 200、以及 8 线程并发请求全部成功。
+
+备份摘要覆盖：`BatchReport` → `BackupSummary` 的计数映射、落盘 / 读回往返、文件不存在时返回 `None`；另用本地假 Alist 实跑 `backup`，验证成功后摘要写入 `~/.aether/last-backup.json`、失败时 `failed` 计数正确（逐项失败不中断整批）。
 
 ## 后续路线（TODO）
 
@@ -283,6 +289,6 @@ UI 部分覆盖：快照 JSON 的 camelCase 字段与 `state: null`、倒计时�
 | 1 | 目录递归与批量备份 | ✅ 已实现 | `src/backup.rs::plan` 递归枚举，排除 `.git` / `bin` / `obj`，失败继续并汇总，进度按整体字节。**遗留**：Alist `PUT` 是否自动创建多级父目录尚未用真实服务端验证，若不支持需补 `/api/fs/mkdir`。 |
 | 2 | 断点续传与分片 | ✅ 已实现（任务级） | **字节级续传不可行**：Alist `/api/fs/put` 是整文件 PUT，官方无分片合并 / Range 接口（`Content-Range` 仅第三方 OpenList_Chunk fork）。已实现任务级断点：`src/resume.rs` 持久化已完成文件指纹到 `~/.aether/backups/`，逐项落盘、失败保留、成功后自清理，`--resume` / `--reset-resume` 控制。**遗留**：单文件中断仍需整文件重传。 |
 | 3 | 同步防冲突校验 | ✅ 已实现 | `POST /api/fs/get` 探测 + size 比对，默认 `skip`，另有 `overwrite` / `rename`；本地占用用 open 预检 + 上传前后 metadata 一致性。**遗留**：未做 hash / 时间戳大小比对；`--json` 的 `BatchReport.detail` 已结构化保留冲突原因，待 #4 的 UI 消息中心直接消费。 |
-| 4 | 系统托盘 / UI | ✅ 已实现（网页看板） | `src/ui.rs`：`aether ui` 起 `127.0.0.1:7878` 单页看板（大环倒计时 + 策略 / 待提交 / 心跳 / 上次同步 + 流程指示），`status --watch` 提供终端等价物，`/api/state` 供托盘复用。零新依赖、离线可用、引擎被杀也能显示未运行。**遗留**：只读（不能暂停 / 切策略 / 立即触发）、无鉴权故不对外监听、原生托盘未做；`BatchReport` 的冲突消息尚未接入看板（当前看板只读状态文件，不读备份报告）。 |
+| 4 | 系统托盘 / UI | ✅ 已实现（网页看板） | `src/ui.rs`：`aether ui` 起 `127.0.0.1:7878` 单页看板（大环倒计时 + 策略 / 待提交 / 心跳 / 上次同步 + 流程指示），`status --watch` 提供终端等价物，`/api/state` 供托盘复用。零新依赖、离线可用、引擎被杀也能显示未运行。**遗留**：只读（不能暂停 / 切策略 / 立即触发）、无鉴权故不对外监听、原生托盘未做；`BatchReport` 已接入看板（汇总数量 / 远端目录 / 字节 / 耗时，失败标红），但逐项冲突明细仍未展示。 |
 
 关联现状：`backup` 已支持目录批量，但仍未接入 `start` 的 commit 后自动同步流程；详见「已知限制」。

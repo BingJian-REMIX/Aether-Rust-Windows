@@ -408,6 +408,7 @@ fn backup(
         token: &token,
         policy,
     };
+    let started_at = std::time::Instant::now();
     let result = backup::run_backup(
         &client,
         &local,
@@ -418,6 +419,7 @@ fn backup(
     );
     stop.store(true, Ordering::Relaxed);
     let _ = progress.join();
+    let elapsed = started_at.elapsed().as_secs();
 
     let report = match result {
         Ok(value) => value,
@@ -426,6 +428,11 @@ fn backup(
             return 2;
         }
     };
+    // 摘要落盘失败不该让一次成功的备份变成失败，只提示。
+    let summary = backup::BackupSummary::from_report(&report, &local, &remote, total, elapsed);
+    if let Err(error) = summary.save(&default_home()) {
+        eprintln!("warning: cannot record backup summary: {error}");
+    }
     if as_json {
         println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
         return if report.ok() { 0 } else { 1 };

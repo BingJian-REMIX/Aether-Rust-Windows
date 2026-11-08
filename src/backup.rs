@@ -8,7 +8,7 @@ use crate::options::DEFAULT_EXCLUDES;
 use crate::resume::{ResumeEntry, ResumeStore};
 use clap::ValueEnum;
 use reqwest::blocking::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -68,6 +68,63 @@ impl BatchReport {
 
     pub fn ok(&self) -> bool {
         self.counts().2 == 0
+    }
+}
+
+/// 最近一次备份的摘要，`aether backup` 结束时落盘，供 `aether ui` 展示。
+///
+/// 单独一个文件而不是塞进 `state.json`：备份是独立命令，可能和 `start`
+/// 的引擎进程同时存在，写同一份状态会互相覆盖（引擎每 5s 心跳写一次）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupSummary {
+    pub finished_at: u64,
+    pub local: String,
+    pub remote: String,
+    pub uploaded: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    /// 命中断点、完全没发网络请求的项数。
+    pub resumed: usize,
+    /// 计划上传的总字节数。
+    pub bytes: u64,
+    pub duration_secs: u64,
+}
+
+impl BackupSummary {
+    pub fn from_report(
+        report: &BatchReport,
+        local: &Path,
+        remote: &str,
+        bytes: u64,
+        duration_secs: u64,
+    ) -> Self {
+        let (uploaded, skipped, failed) = report.counts();
+        Self {
+            finished_at: unix_now(),
+            local: local.display().to_string().replace('\\', "/"),
+            remote: remote.to_string(),
+            uploaded,
+            skipped,
+            failed,
+            resumed: report.resumed,
+            bytes,
+            duration_secs,
+        }
+    }
+
+    pub fn path(home: &Path) -> PathBuf {
+        home.join("last-backup.json")
+    }
+
+    pub fn save(&self, home: &Path) -> std::io::Result<()> {
+        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        crate::state::atomic_write(&Self::path(home), json.as_bytes())
+    }
+
+    pub fn load(home: &Path) -> Option<Self> {
+        let text = fs::read_to_string(Self::path(home)).ok()?;
+        serde_json::from_str(&text).ok()
     }
 }
 
@@ -412,6 +469,47 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn summary_maps_report_counts_and_roundtrips() {
+        let report = BatchReport {
+            items: vec![
+                BackupItem {
+                    local: "a.txt".into(),
+                    remote: "/r/a.txt".into(),
+                    outcome: Outcome::Uploaded,
+                    detail: String::new(),
+                },
+                BackupItem {
+                    local: "b.txt".into(),
+                    remote: "/r/b.txt".into(),
+                    outcome: Outcome::Skipped,
+                    detail: "same size".into(),
+                },
+            ],
+            resumed: 4,
+        };
+
+        let summary = BackupSummary::from_report(&report, Path::new("C:/src"), "/r", 1536, 12);
+        assert_eq!(summary.uploaded, 1);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.resumed, 4);
+        assert_eq!(summary.local, "C:/src");
+        assert_eq!(summary.bytes, 1536);
+
+        let dir = TempDir::new().unwrap();
+        summary.save(dir.path()).unwrap();
+        let loaded = BackupSummary::load(dir.path()).expect("summary should roundtrip");
+        assert_eq!(loaded.remote, "/r");
+        assert_eq!(loaded.duration_secs, 12);
+    }
+
+    #[test]
+    fn summary_load_returns_none_when_absent() {
+        let dir = TempDir::new().unwrap();
+        assert!(BackupSummary::load(dir.path()).is_none());
+    }
 
     #[test]
     fn plans_single_file_exactly_like_before() {

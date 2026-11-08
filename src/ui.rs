@@ -11,6 +11,7 @@
 //! 只监听 `127.0.0.1`：面板没有鉴权，暴露到 0.0.0.0 等于把仓库路径与提交信息
 //! 公开到局域网。
 
+use crate::backup::BackupSummary;
 use crate::options::parse_duration;
 use crate::state::{is_running, now, State, StateStore};
 use serde::Serialize;
@@ -42,9 +43,11 @@ struct Snapshot {
     heartbeat_age_seconds: u64,
     state_path: String,
     state: Option<State>,
+    /// 最近一次 `aether backup` 的摘要；从未备份过为 `null`。
+    last_backup: Option<BackupSummary>,
 }
 
-fn snapshot(store: &StateStore) -> Snapshot {
+fn snapshot(store: &StateStore, home: &Path) -> Snapshot {
     let state = store.load();
     let running = state.as_ref().map(is_running).unwrap_or(false);
     let delay_seconds = state
@@ -68,6 +71,7 @@ fn snapshot(store: &StateStore) -> Snapshot {
         heartbeat_age_seconds,
         state_path: store.path().display().to_string().replace('\\', "/"),
         state,
+        last_backup: BackupSummary::load(home),
     }
 }
 
@@ -154,7 +158,7 @@ fn handle_connection(mut stream: TcpStream, home: &Path) {
         return;
     }
 
-    let store = StateStore::new(home);
+    let store = StateStore::new(&home);
     match path {
         "/" | "/index.html" => write_response(
             &mut stream,
@@ -163,7 +167,8 @@ fn handle_connection(mut stream: TcpStream, home: &Path) {
             INDEX_HTML.as_bytes(),
         ),
         "/api/state" => {
-            let body = serde_json::to_vec(&snapshot(&store)).unwrap_or_else(|_| b"{}".to_vec());
+            let body =
+                serde_json::to_vec(&snapshot(&store, &home)).unwrap_or_else(|_| b"{}".to_vec());
             write_response(
                 &mut stream,
                 "200 OK",
@@ -318,6 +323,12 @@ const INDEX_HTML: &str = r##"<!doctype html>
   .step.on{color:var(--ink); border-style:solid; border-color:color-mix(in srgb,var(--accent) 45%,var(--line)); background:color-mix(in srgb,var(--accent) 8%,transparent)}
   .step i{width:6px; height:6px; border-radius:50%; background:currentColor; opacity:.5}
   .step.on i{opacity:1; background:var(--accent)}
+  /* 备份摘要：一行式，和上面两张面板区分开。 */
+  .strip{display:flex; align-items:center; gap:10px 14px; flex-wrap:wrap; background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:11px 14px; box-shadow:var(--shadow)}
+  .strip .k{font-size:11px; color:var(--muted); letter-spacing:.04em; text-transform:uppercase}
+  .strip strong{font-size:13px; font-weight:600}
+  .strip .meta{font-size:11px; color:var(--muted); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .strip .ok{color:var(--ok)} .strip .warn{color:var(--warn)} .strip .bad{color:var(--bad)}
   footer{display:flex; justify-content:space-between; gap:12px; font-size:11px; color:var(--muted); flex-wrap:wrap}
   .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:60ch}
   .offline{color:var(--bad)}
@@ -356,6 +367,12 @@ const INDEX_HTML: &str = r##"<!doctype html>
     <div class="step" data-step="syncing"><i></i>推送</div>
   </section>
 
+  <section class="strip" id="backupStrip">
+    <span class="k">上次备份</span>
+    <strong id="bkCounts">尚无记录</strong>
+    <span class="meta" id="bkMeta">运行 aether backup 后显示</span>
+  </section>
+
   <footer>
     <span class="mono" id="statePath">-</span>
     <span id="updated">等待数据…</span>
@@ -374,6 +391,39 @@ function fmt(sec){
 }
 const LABEL = { starting: '启动中', watching: '监听中', countdown: '倒计时', syncing: '同步中', reminded: '已提醒', stopped: '已停止' };
 
+function ago(ts){
+  const sec = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+  if (sec < 60) return sec + 's 前';
+  if (sec < 3600) return Math.floor(sec / 60) + 'm 前';
+  if (sec < 86400) return Math.floor(sec / 3600) + 'h 前';
+  return Math.floor(sec / 86400) + 'd 前';
+}
+function humanSize(bytes){
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = bytes || 0, index = 0;
+  while (value >= 1024 && index < units.length - 1) { value /= 1024; index++; }
+  return (index === 0 ? value : value.toFixed(1)) + ' ' + units[index];
+}
+function paintBackup(bk){
+  const counts = el('bkCounts');
+  if (!bk) {
+    counts.textContent = '尚无记录';
+    counts.className = '';
+    el('bkMeta').textContent = '运行 aether backup 后显示';
+    el('bkMeta').title = '';
+    return;
+  }
+  const parts = [bk.uploaded + ' 上传', bk.skipped + ' 跳过'];
+  if (bk.failed) parts.push(bk.failed + ' 失败');
+  counts.textContent = parts.join(' · ');
+  counts.className = bk.failed ? 'bad' : (bk.uploaded ? 'ok' : '');
+  const bits = [ago(bk.finishedAt), bk.remote, humanSize(bk.bytes)];
+  if (bk.resumed) bits.push(bk.resumed + ' 命中续传');
+  if (bk.durationSecs >= 1) bits.push('耗时 ' + bk.durationSecs + 's');
+  el('bkMeta').textContent = bits.join(' · ');
+  el('bkMeta').title = bk.local + ' → ' + bk.remote;
+}
+
 function paintCountdown(){
   const nowSec = Math.floor(Date.now() / 1000);
   if (!deadline) {
@@ -391,8 +441,7 @@ function paintCountdown(){
 }
 
 function render(data){
-  const st = data.state || {};
-  document.body.dataset.running = data.running ? 'on' : 'off';
+  const st = data.state || {};  document.body.dataset.running = data.running ? 'on' : 'off';
   el('status').textContent = data.running ? (LABEL[st.state] || st.state || '运行中') : '未运行';
   el('repo').textContent = st.repository || '（尚无状态文件）';
   el('repo').title = st.repository || '';
@@ -421,6 +470,8 @@ function render(data){
     const key = node.dataset.step;
     node.classList.toggle('on', st.state === key || (key === 'watching' && st.state === 'starting'));
   });
+
+  paintBackup(data.lastBackup);
 
   el('statePath').textContent = data.statePath || '';
   el('statePath').title = data.statePath || '';
@@ -461,7 +512,7 @@ mod tests {
         if let Some(value) = state {
             store.save(&value).unwrap();
         }
-        snapshot(&store)
+        snapshot(&store, dir.path())
     }
 
     #[test]
@@ -470,6 +521,38 @@ mod tests {
         assert!(!value.running);
         assert_eq!(value.remaining_seconds, 0);
         assert!(value.state.is_none());
+        assert!(value.last_backup.is_none());
+    }
+
+    #[test]
+    fn backup_summary_is_exposed_when_present() {
+        let dir = TempDir::new().unwrap();
+        let summary = BackupSummary {
+            finished_at: now(),
+            local: "C:/src".into(),
+            remote: "/backup".into(),
+            uploaded: 3,
+            skipped: 1,
+            failed: 0,
+            resumed: 2,
+            bytes: 2048,
+            duration_secs: 7,
+        };
+        summary.save(dir.path()).unwrap();
+
+        let value = snapshot(&StateStore::new(dir.path()), dir.path());
+        let exposed = value.last_backup.expect("summary should be loaded");
+        assert_eq!(exposed.uploaded, 3);
+        assert_eq!(exposed.remote, "/backup");
+        assert_eq!(exposed.duration_secs, 7);
+    }
+
+    #[test]
+    fn corrupt_backup_summary_is_ignored_instead_of_failing() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(BackupSummary::path(dir.path()), b"{not json").unwrap();
+        let value = snapshot(&StateStore::new(dir.path()), dir.path());
+        assert!(value.last_backup.is_none());
     }
 
     #[test]
