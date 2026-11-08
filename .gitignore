@@ -1,0 +1,12 @@
+# Build output
+/target
+/dist
+
+# Binaries (published as Release assets, never committed)
+*.exe
+*.pdb
+*.dll
+
+# Temp / logs
+*.tmp
+*.log
