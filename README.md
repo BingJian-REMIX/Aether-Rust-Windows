@@ -8,6 +8,15 @@
 - 语言：Rust 2021；CLI / 同步引擎不暴露异步生命周期（HTTP 用阻塞式 API），无 unsafe
 - 仓库根：本目录（`Aether-Rust/`），crate 直接位于根下
 
+## 远端
+
+| 角色 | 地址 | 本地远端名 |
+| --- | --- | --- |
+| **主仓**（以此为准） | `https://cnb.cool/RLRS-Studio/Aether-Rust-Windows` | `origin` |
+| 镜像（只读同步） | `https://github.com/BingJian-REMIX/Aether-Rust-Windows` | `github` |
+
+`main` 跟踪 `origin/main`。发布、Issues、Release 都在主仓；GitHub 侧只做代码镜像（分支 + tag 保持一致），不接受独立改动。
+
 ## 环境要求
 
 - Rust ≥ 1.88（`rustup` + `cargo`；依赖树中 `icu_normalizer 2.4` / `clap 4.6` 的 MSRV 决定）
